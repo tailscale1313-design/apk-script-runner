@@ -1,0 +1,232 @@
+
+```
+[Script Runner APK]  ──SSH (port 8022)──>  [Termux: sshd + nmap]
+   input box  ──command──>                  installs/updates pkgs, runs nmap
+   output box <──stream──                   live output (mirror view)
+```
+
+Since both apps live on the same phone, the APK just connects to `127.0.0.1:8022`. Anything you type ("scan ports", "update packages", "run ls") gets translated to shell commands and streamed back live.
+
+## Part 1 — Termux side (one-time setup)
+
+```bash
+pkg update && pkg upgrade -y
+pkg install openssh nmap -y
+passwd            # set a password for SSH
+sshd              # start the SSH server (port 8022)
+```
+
+Leave Termux running in the background. Optionally use `termux-wake-lock` so Android doesn't kill it.
+
+## Part 2 — The APK (Android Studio)
+
+**1. `app/build.gradle`** — add the SSH library:
+
+```gradle
+dependencies {
+    implementation 'com.jcraft:jsch:0.1.55'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+}
+```
+
+**2. `AndroidManifest.xml`** — permissions:
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+<uses-permission android:name="android.permission.WAKE_LOCK" />
+```
+
+**3. `res/layout/activity_main.xml`** — two boxes + mirror toggle:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <EditText
+        android:id="@+id/inputBox"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Tell the runner what you want… (e.g. scan ports)"
+        android:imeOptions="actionDone"
+        android:singleLine="true" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/connectBtn"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:text="Connect" />
+
+        <ToggleButton
+            android:id="@+id/mirrorToggle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textOn="Mirror: ON"
+            android:textOff="Mirror: OFF" />
+    </LinearLayout>
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#0d1117">
+
+        <TextView
+            android:id="@+id/outputBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="#3fb950"
+            android:textSize="12sp"
+            android:padding="8dp"
+            android:text="" />
+    </ScrollView>
+</LinearLayout>
+```
+
+**4. `MainActivity.kt`** — the whole brain (interprets your request, runs it over SSH, streams output live):
+
+```kotlin
+package com.scriptrunner.app
+
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.method.LinkMovementMethod
+import android.widget.Button
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
+import android.widget.ToggleButton
+import androidx.appcompat.app.AppCompatActivity
+import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
+import java.io.InputStream
+import kotlin.concurrent.thread
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var inputBox: EditText
+    private lateinit var outputBox: TextView
+    private lateinit var connectBtn: Button
+    private lateinit var mirrorToggle: ToggleButton
+
+    private var session: Session? = null
+    private val ui = Handler(Looper.getMainLooper())
+
+    // same phone = loopback; password you set with `passwd` in Termux
+    private val HOST = "127.0.0.1"
+    private val PORT = 8022
+    private val USER = "whoami"   // whatever `whoami` prints in Termux (usually "u0_aXXX")
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        inputBox = findViewById(R.id.inputBox)
+        outputBox = findViewById(R.id.outputBox)
+        connectBtn = findViewById(R.id.connectBtn)
+        mirrorToggle = findViewById(R.id.mirrorToggle)
+
+        inputBox.setOnEditorActionListener { _, _, _ ->
+            sendCommand(inputBox.text.toString())
+            true
+        }
+        connectBtn.setOnClickListener {
+            if (session?.isConnected == true) disconnect() else connect()
+        }
+    }
+
+    private fun append(text: String) {
+        ui.post {
+            if (mirrorToggle.isChecked || !text.startsWith("\u0000")) {
+                outputBox.append(text)
+            }
+        }
+    }
+
+    private fun connect() {
+        connectBtn.isEnabled = false
+        thread {
+            try {
+                append("\n$ Connecting to Termux…\n")
+                val jsch = JSch()
+                val s = jsch.getSession(USER, HOST, PORT)
+                s.setPassword("YOUR_TERMUX_PASSWORD")   // from `passwd`
+                s.setConfig("StrictHostKeyChecking", "no")
+                s.connect(10000)
+                session = s
+                ui.post {
+                    connectBtn.text = "Disconnect"
+                    append("Connected to Termux.\n")
+                }
+            } catch (e: Exception) {
+                append("Connect failed: ${e.message}\n")
+                append("Is sshd running in Termux? (pkg install openssh && sshd)\n")
+            }
+            ui.post { connectBtn.isEnabled = true }
+        }
+    }
+
+    private fun disconnect() {
+        session?.disconnect()
+        session = null
+        connectBtn.text = "Connect"
+        append("Disconnected.\n")
+    }
+
+    // turns plain-English requests into Termux commands
+    private fun buildScript(request: String): String {
+        val r = request.lowercase()
+        return when {
+            r.contains("scan") && (r.contains("port") || r.contains("nmap")) ->
+                "pkg update -y && pkg upgrade -y; nmap 127.0.0.1"
+            r.contains("update") || r.contains("upgrade") ->
+                "pkg update -y && pkg upgrade -y"
+            r.contains("whoami") -> "whoami"
+            else -> request   // power user: send raw shell directly
+        }
+    }
+
+    private fun sendCommand(request: String) {
+        val s = session
+        if (s?.isConnected != true) {
+            append("Not connected — tap Connect first.\n")
+            return
+        }
+        val script = buildScript(request)
+        append("\n$ $script\n")
+        thread {
+            try {
+                val ch = s.openChannel("exec") as ChannelExec
+                ch.setCommand("bash -l -c '$script'")
+                ch.setErrStream(ch.extOutputStream)
+                val input: InputStream = ch.inputStream
+                ch.connect()
+                val buf = ByteArray(4096)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    append(String(buf, 0, n))
+                }
+                ch.disconnect()
+                append("\n[done]\n")
+            } catch (e: Exception) {
+                append("Error: ${e.message}\n")
+            }
+        }
+    }
+
+    ov
